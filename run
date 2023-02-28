@@ -1,0 +1,1035 @@
+#!/bin/bash -l
+
+export PATH="$PATH:/usr/local/bin:/opt/homebrew/bin"
+
+function check_result {
+    exit_status=$?
+    if [[ exit_status -ne 0 && !$ignore_test_failures ]]; then
+        echo "Exiting"
+        copy_artifacts
+        exit $exit_status
+    fi
+}
+
+function lint {    
+    echo "Running the lint"
+    bundle exec fastlane lint
+    check_result
+}
+
+function test {
+    echo "Running unit tests"
+    target="MyOptusUnitTests"
+
+    setup_testing
+
+    if is_gomo; then
+        target="GOMOUnitTests"
+    fi
+    bundle exec fastlane unit_test schemes:$Scheme target:$target
+    check_result
+
+    cleanup
+}
+
+function coverage {
+    echo "Generating coverage report"
+    bundle exec fastlane code_coverage schemes:$Scheme
+    check_result
+}
+
+function sonar_scan {
+    if is_gomo; then
+        return
+    fi
+
+    if [[ -z $Branch || -z $JavaHome || -z $SonarScanner ]]; then
+        echo "These parameters are required:"
+        echo "Branch, JavaHome, SonarScanner"
+        exit 255
+    fi
+
+    if [[ -n $TargetBranches ]]; then
+      # Loop over target branches that are in open pull requests. 
+      for i in $(echo $TargetBranches); do 
+        targetName=$(sed -E 's~refs/heads/(.*)~\1~g' <<< $i)
+        echo "branchName: $Branch"
+        echo "targetName: $targetName"
+        JAVA_HOME=$JavaHome \
+        SONAR_SCANNER_OPTS="-Dsonar.projectKey=moa-ios \
+        -Dsonar.sources=. \
+        -Dsonar.c.file.suffixes=- \
+        -Dsonar.cpp.file.suffixes=- \
+        -Dsonar.objc.file.suffixes=- \
+        -Dsonar.cfamily.build-wrapper-output.bypass=true \
+        -Dsonar.coverageReportPaths=build/coverage_output/sonarqube-generic-coverage.xml \
+        -Dsonar.swift.swiftLint.reportPaths=build/swiftlint-results.json  \
+        -Dsonar.branch.name=$Branch \
+        -Dsonar.branch.target=${targetName}" \
+        $SonarScanner -X 
+      done
+    else 
+        JAVA_HOME=$JavaHome \
+        SONAR_SCANNER_OPTS="-Dsonar.projectKey=moa-ios \
+        -Dsonar.sources=. \
+        -Dsonar.c.file.suffixes=- \
+        -Dsonar.cpp.file.suffixes=- \
+        -Dsonar.objc.file.suffixes=- \
+        -Dsonar.cfamily.build-wrapper-output.bypass=true \
+        -Dsonar.coverageReportPaths=build/coverage_output/sonarqube-generic-coverage.xml \
+        -Dsonar.swift.swiftLint.reportPaths=build/swiftlint-results.json \
+        -Dsonar.branch.name=$Branch" \
+        $SonarScanner
+    fi
+
+    if [[ "$?" -ne "0" ]]; then
+        echo "Sonar Scan Failed"
+    fi
+}
+
+function copy_artifacts {
+    echo "Copying artifacts"
+    local dir=$1
+    if [[ -z $dir ]]; then
+        dir=$Scheme
+    fi
+
+    if [[ -z $dir ]]; then
+        echo "No argument passed and cannot find scheme"
+        return
+    fi
+
+    mkdir -p artifacts/$dir
+
+    cp build/swiftlint-results.html artifacts/$dir/swiftlint-results.html
+    rm -f build/swiftlint-results.html
+
+    cp build/swiftlint-results.json artifacts/$dir/swiftlint-results.json
+    rm -f build/swiftlint-results.json
+
+    cp -r build/coverage_output/. artifacts/$dir/coverage_output
+    rm -rf build/coverage_output
+
+    cp -r build/coverage_output_html/. artifacts/$dir/coverage_output_html
+    rm -rf build/coverage_output_html
+
+    cp -r build/test_output/. artifacts/$dir/test_output
+    rm -rf build/test_output
+}
+
+function coverage_report {
+    if [[ -z $Scheme && -z $Schemes ]]; then
+        echo "Scheme is not specified"
+        exit 255
+    fi
+
+    local runningScheme=$Scheme
+    if [[ -z $runningScheme ]]; then
+        runningScheme=$Schemes
+    fi
+
+    runningSchemes=$(echo $runningScheme | tr ';' '\n')
+
+    setup &&
+    lint
+
+    cp build/swiftlint-results.* artifacts/
+
+    for rs in $runningSchemes
+    do
+        Scheme=$rs
+        echo "Running coverage report for " $Scheme
+        test &&
+        coverage
+        copy_artifacts
+    done
+}
+
+function sonar_pull_request {
+    if [[ -z "$LongRun" || $LongRun == false ]]; then
+        echo "Skipping this build since no long running branches are targets"
+        exit
+    fi
+
+    if [[ -z $Scheme ]]; then
+        echo "Scheme is not specified"
+        echo ""
+        echo "Example:"
+        echo "./run sonar_pull_request Scheme=MyOptusTesting"
+        echo "./run sonar_pull_request LongRun=true Scheme=MyOptusTesting"
+        echo "./run sonar_pull_request LongRun=true Scheme=MyOptusTesting Password=PASSWORD"
+        exit 255
+    fi
+
+    setup &&
+    lint &&
+    test &&
+    coverage
+    copy_artifacts
+
+}
+
+function generate_color_assets {
+    if is_gomo || [[ -z $Env ]]; then
+        echo " Generating color assets for GOMO"
+        cat "Common/Color.swift" "GOMO/Color+value.swift" "GenerateColorAssets.swift" \
+        | sed 's/UIKit/AppKit/g' \
+        | sed 's/UIColor/NSColor/g' \
+        | sed 's/MyOptus/GOMO/g' > ColorGenerator.swift
+        swift ColorGenerator.swift
+        rm ColorGenerator.swift
+    fi
+
+    if [[ $Env =~ myoptus* || -z $Env ]]; then
+        echo " Generating color assets for MyOptus"
+        cat "Common/Color.swift" "MyOptus/Color+value.swift" "GenerateColorAssets.swift" \
+        | sed 's/UIKit/AppKit/g' \
+        | sed 's/UIColor/NSColor/g' > ColorGenerator.swift
+        swift ColorGenerator.swift
+        rm ColorGenerator.swift
+    fi
+}
+
+function run_gyb {
+    chmod +x gyb
+    find . -name '*.gyb' |                                \
+    while read file; do                                   \
+      ./gyb --line-directive '' -o "${file%.gyb}" "$file";\
+    done
+}
+
+function update_pods {
+    rm -rf ./Pods
+
+    if [[ $command != "setup" ]]; then
+        pod repo update
+        pod install
+    else 
+        pod_repo_update
+        pod_install
+    fi
+}
+
+function unlock_keychain {
+    if [[ -n $Password ]]; then
+        echo "Unlocking Keychain"
+        /usr/bin/security unlock-keychain -p "$Password" $HOME/Library/Keychains/login.keychain-db
+    fi
+}
+
+function make_dir {
+    mkdir -p build
+    mkdir -p artifacts
+}
+
+function print_gem_env {
+    echo "GEM PATH START==============================="
+    gem env
+    echo "GEM PATH END==============================="
+}
+
+# Install or upgrade a specified brew package.
+function install_or_upgrade {
+    local processor=$(sysctl -n machdep.cpu.brand_string | tr '[A-Z]' '[a-z]')
+    local command="install"
+    local message="Installing"
+
+    echo "Searching for" $1
+    if command -v $1 &> /dev/null
+    then
+        # If already installed and we don't wish to upgrade, exit now
+        if [[ $Upgrade != true ]]; then
+            echo "$1 already installed"
+            return
+        fi
+
+        message="Upgrading"
+        command="upgrade"
+    fi
+
+    echo $message $1
+    brew $command $1
+	echo "$message $1 done!"
+    
+}
+
+function install_or_upgrade_tooling {
+    install_brew &&
+    install_or_upgrade swiftlint &&
+   install_or_upgrade swiftformat
+}
+
+function install_with_npm {
+   local command="install"
+   local message="Installing"
+
+   echo "Searching for" $1
+   if command -v $1 &> /dev/null
+   then
+       # If already installed and we don't wish to upgrade, exit now
+       if [[ $Upgrade != true ]]; then
+           echo "$1 already installed"
+           return
+       fi
+
+       message="Upgrading"
+       command="upgrade"
+   fi
+   
+   npm $command --global $1
+}
+
+function install_cocoapods {
+    local podfile_lock_version=$(cat Podfile.lock 2> /dev/null | grep COCOAPODS | sed -E s/cocoapods://Ig)
+    local cocoapods_version=$(pod --version 2> /dev/null | grep -E '(\d+\.?)+')
+    local cocoapods_path=$(command -v pod)
+    echo "Searching for CocoaPods"
+    if [[ -z $cocoapods_path ]];
+    then
+        echo "Installing CocoaPods using Gem"
+        gem install cocoapods
+    elif [[ ! $podfile_lock_version =~ $cocoapods_version ]];
+    then
+        echo "CocoaPods already installed but its version ($cocoapods_version) does not match the Podfile.lock ($podfile_lock_version)"
+        gem install cocoapods
+    else
+        echo "CocoaPods is already installed"
+    fi
+}
+
+function install_brew {
+    echo "Searching for HomeBrew"
+    if ! command -v brew &> /dev/null
+    then
+        echo "Installing brew"
+#         /bin/bash -c "$(curl -fsSL https://raw.githubusercontent.com/Homebrew/install/HEAD/install.sh)"
+    else 
+        echo "HomeBrew is already installed"
+    fi
+}
+
+function install_rbenv {
+    echo "Searching for rbenv"
+
+    if ! command -v rbenv &> /dev/null
+    then
+        echo "Installing rbenv"
+        brew install rbenv
+    else
+        echo "rbenv is already installed"
+    fi
+}
+
+function install_ruby {
+    local ruby_version=$(cat .ruby-version)
+    if [[ -z $(rbenv versions --bare | grep $ruby_version) ]]; then
+        echo "Installing ruby version $ruby_version using rbenv"
+        rbenv install $ruby_version
+    else
+        echo "Ruby version $ruby_version is already installed"
+    fi
+
+    eval "$(rbenv init - bash)"
+    rbenv shell $ruby_version
+}
+
+function install_dependencies {
+    Upgrade=true
+    install_brew
+    # install_rbenv
+    # install_ruby
+    install_cocoapods
+    install_or_upgrade npm
+    install_or_upgrade swiftlint
+    install_or_upgrade swiftformat
+    install_or_upgrade xcodes
+    echo "Installing git-format-staged"
+    install_with_npm git-format-staged
+
+    if [[ $RunBundler == "true" ]]; then
+        bundle install
+    fi
+}
+
+function disable_git_hooks {
+    echo "Disabling git hooks"
+    rm -rf .git/hooks
+}
+
+function prepare_git_hooks {
+    echo "Setting up hooks"
+    rm -rf .git/hooks
+    cd .git 
+    ln -s ../hooks hooks
+    cd ..
+    chmod +x hooks/pre-commit
+    chmod +x hooks/prepare-commit-msg
+}
+
+function update_build_phases {
+	echo "Removing unnecessary build phases from the project"
+#     sed -i '' 's/^.*\/\* Code Generation Using Gyb \*\/,$//g' Libraries/Secrets/Secrets.xcodeproj/project.pbxproj
+#     sed -i '' 's/^.*\/\* Run SwiftFormat \*\/,$//g' SelfService.xcodeproj/project.pbxproj
+#     sed -i '' 's/^.*\/\* Run Swiftlint \*\/,$//g' SelfService.xcodeproj/project.pbxproj
+}
+
+function update_bundle_identifiers {
+    from=$1
+    to=$2
+    if is_gomo; then
+        echo "Not ready yet"
+    else
+        sed -i '' "s/identifier\: String = \"group.au.com.optus.${from}/identifier\: String = \"group.au.com.optus.${to}/g" MyOptus/AppGroupIdentifier.swift
+
+        sed -i '' "s/<string>group.au.com.optus.${from}.widget<\/string>/<string>group.au.com.optus.${to}.widget<\/string>/g" MyOptus/MyOptus.entitlements
+        sed -i '' "s/<string>group.au.com.optus.${from}.shared<\/string>/<string>group.au.com.optus.${to}.shared<\/string>/g" MyOptus/MyOptus.entitlements
+        sed -i '' "s/<string>group.au.com.optus.${from}.widget<\/string>/<string>group.au.com.optus.${to}.widget<\/string>/g" MyOptusWidgetFamily/MyOptusWidgetFamily.entitlements
+        sed -i '' "s/<string>group.au.com.optus.${from}.widget<\/string>/<string>group.au.com.optus.${to}.widget<\/string>/g" MyOptusWidgetIntents/MyOptusWidgetIntents.entitlements
+        
+        sed -i '' "s/PRODUCT_BUNDLE_IDENTIFIER = au.com.optus.${from};/PRODUCT_BUNDLE_IDENTIFIER = au.com.optus.${to};/g" SelfService.xcodeproj/project.pbxproj
+        sed -i '' "s/PRODUCT_BUNDLE_IDENTIFIER = au.com.optus.${from}.widgetfamily;/PRODUCT_BUNDLE_IDENTIFIER = au.com.optus.${to}.widgetfamily;/g" SelfService.xcodeproj/project.pbxproj
+        sed -i '' "s/PRODUCT_BUNDLE_IDENTIFIER = au.com.optus.${from}.widgetintents;/PRODUCT_BUNDLE_IDENTIFIER = au.com.optus.${to}.widgetintents;/g" SelfService.xcodeproj/project.pbxproj
+        sed -i '' "s/PRODUCT_BUNDLE_IDENTIFIER = au.com.optus.${from}.AirshipNotificationService;/PRODUCT_BUNDLE_IDENTIFIER = au.com.optus.${to}.AirshipNotificationService;/g" SelfService.xcodeproj/project.pbxproj
+    fi
+}
+
+function add_esim_entitlements {
+    if is_gomo; then
+        echo "Not ready yet"
+    else
+        starting_line=$(grep -n '<key>com.apple.CommCenter.fine-grained<\/key>' MyOptus/MyOptus.entitlements | grep -oE '\d*')
+        if [[  -n  $starting_line ]]; then
+            return
+        fi
+        sed \$d MyOptus/MyOptus.entitlements| sed \$d > MyOptus/MyOptus.entitlements-temp
+        echo '  <key>com.apple.CommCenter.fine-grained</key>' >> MyOptus/MyOptus.entitlements-temp
+        echo '  <array>' >> MyOptus/MyOptus.entitlements-temp
+        echo '      <string>public-cellular-plan</string>' >> MyOptus/MyOptus.entitlements-temp
+        echo '  </array>' >> MyOptus/MyOptus.entitlements-temp
+        echo '</dict>' >> MyOptus/MyOptus.entitlements-temp
+        echo '</plist>' >> MyOptus/MyOptus.entitlements-temp
+
+        mv MyOptus/MyOptus.entitlements-temp MyOptus/MyOptus.entitlements
+    fi
+}
+
+function remove_esim_entitlements {
+    if is_gomo; then
+        echo "Not ready yet"
+    else
+        starting_line=$(grep -n '<key>com.apple.CommCenter.fine-grained<\/key>' MyOptus/MyOptus.entitlements | grep -oE '\d*')
+        if [[ -z  $starting_line ]]; then
+            return
+        fi
+        ending_line=$((starting_line+3))
+        sed $starting_line','$ending_line'd' MyOptus/MyOptus.entitlements > MyOptus/MyOptus.entitlements-temp
+        mv MyOptus/MyOptus.entitlements-temp MyOptus/MyOptus.entitlements
+    fi
+}
+
+# Check if a string `$1` matches a regex `$2`
+function RegexTest() {
+    if [[ "$1" =~ $2 ]]; then
+        return 0
+    else
+        return 1
+    fi
+}
+
+function update_signing {
+    signing_entitlements=$1
+    signing_identity=$2 # Developer, Distribution
+    locations=$(grep -n "CODE_SIGN_ENTITLEMENTS = $signing_entitlements;" SelfService.xcodeproj/project.pbxproj | grep -o '\d*\:' | grep -o '\d*')
+    start_location=1
+    
+    touch SelfService.xcodeproj/project.pbxproj-temp
+    for location in $locations
+    do
+        sed -n "${start_location},${location}p" SelfService.xcodeproj/project.pbxproj >> SelfService.xcodeproj/project.pbxproj-temp
+        local next_chunk_first_line=$(sed -n "$((location + 1))p" SelfService.xcodeproj/project.pbxproj)
+        RegexTest "$next_chunk_first_line" ".*CODE_SIGN_IDENTITY \= \"iPhone $signing_identity\"\;.*"
+        if [[ $? -ne 0 ]]; then
+            echo "                CODE_SIGN_IDENTITY = \"iPhone $signing_identity\";" >> SelfService.xcodeproj/project.pbxproj-temp
+        fi
+        start_location=$((location+1))
+    done
+
+    sed -n "${start_location},\$p" SelfService.xcodeproj/project.pbxproj >> SelfService.xcodeproj/project.pbxproj-temp
+    mv SelfService.xcodeproj/project.pbxproj-temp SelfService.xcodeproj/project.pbxproj
+}
+
+function update_provisioning_profile {
+    bundle_identifier=$1
+    provisioning_profile=$2
+    locations=$(grep -n "PRODUCT_BUNDLE_IDENTIFIER = $bundle_identifier;" SelfService.xcodeproj/project.pbxproj | grep -o '\d*\:' | grep -o '\d*')
+    start_location=1
+    
+    touch SelfService.xcodeproj/project.pbxproj-temp
+    for location in $locations
+    do
+        sed -n "${start_location},${location}p" SelfService.xcodeproj/project.pbxproj >> SelfService.xcodeproj/project.pbxproj-temp
+        local next_chunk_first_line=$(sed -n "$((location + 1))p" SelfService.xcodeproj/project.pbxproj)
+        RegexTest "$next_chunk_first_line" ".*PROVISIONING_PROFILE_SPECIFIER = \"$provisioning_profile\";.*"
+        if [[ $? -ne 0 ]]; then
+            echo "                PROVISIONING_PROFILE_SPECIFIER = \"$provisioning_profile\";" >> SelfService.xcodeproj/project.pbxproj-temp
+        fi
+        start_location=$((location+1))
+    done
+
+    sed -n "${start_location},\$p" SelfService.xcodeproj/project.pbxproj >> SelfService.xcodeproj/project.pbxproj-temp
+    mv SelfService.xcodeproj/project.pbxproj-temp SelfService.xcodeproj/project.pbxproj
+}
+
+function prepare_for_appstore {
+    add_esim_entitlements
+
+    if is_gomo; then
+        echo "Not ready yet"
+    else
+        update_bundle_identifiers "myoptus" "selfserviceapp"
+
+        sed -i '' 's/CODE_SIGN_STYLE = Automatic;/CODE_SIGN_STYLE = Manual;/g' SelfService.xcodeproj/project.pbxproj
+        sed -i '' 's/DEVELOPMENT_TEAM = 7A5XEHKD3N;/DEVELOPMENT_TEAM = 3HG8X849A8;/g' SelfService.xcodeproj/project.pbxproj
+    fi
+}
+
+function prepare_for_enterprise {
+    remove_esim_entitlements
+
+    if is_gomo; then
+        echo "Not ready yet"
+    else
+        update_bundle_identifiers "selfserviceapp" "myoptus"
+
+        sed -i '' 's/CODE_SIGN_STYLE = Manual;/CODE_SIGN_STYLE = Automatic;/g' SelfService.xcodeproj/project.pbxproj
+        sed -i '' 's/DEVELOPMENT_TEAM = 3HG8X849A8;/DEVELOPMENT_TEAM = 7A5XEHKD3N;/g' SelfService.xcodeproj/project.pbxproj
+    fi 
+}
+
+function prepare_for_development {
+    prepare_for_appstore
+
+    if is_gomo; then
+        echo "Not ready yet"
+    else
+        update_signing "MyOptus/MyOptus.entitlements" "Developer"
+        update_signing "MyOptusWidgetFamily/MyOptusWidgetFamily.entitlements" "Developer"
+        update_signing "MyOptusWidgetIntents/MyOptusWidgetIntents.entitlements" "Developer"
+
+        update_provisioning_profile "au.com.optus.selfserviceapp" "MyOptus Development"
+        update_provisioning_profile "au.com.optus.selfserviceapp.widgetfamily" "MyOptus Development - Widget Family"
+        update_provisioning_profile "au.com.optus.selfserviceapp.widgetintents" "MyOptus Development - Widget Intents"
+        update_provisioning_profile "au.com.optus.selfserviceapp.AirshipNotificationService" "MyOptus Development - Airship Notification Service"
+    fi
+}
+
+function prepare_for_distribution {
+    prepare_for_appstore
+
+    if is_gomo; then
+        echo "Not ready yet"
+    else
+        update_signing "MyOptus/MyOptus.entitlements" "Distribution"
+        update_signing "MyOptusWidgetFamily/MyOptusWidgetFamily.entitlements" "Distribution"
+        update_signing "MyOptusWidgetIntents/MyOptusWidgetIntents.entitlements" "Distribution"
+
+        update_provisioning_profile "au.com.optus.selfserviceapp" "MyOptus"
+        update_provisioning_profile "au.com.optus.selfserviceapp.widgetfamily" "MyOptus Widget Family"
+        update_provisioning_profile "au.com.optus.selfserviceapp.widgetintents" "MyOptus - Widget Intents"
+        update_provisioning_profile "au.com.optus.selfserviceapp.AirshipNotificationService" "MyOptus - Airship Notification Service"
+    fi
+}
+
+function prepare_for_adhoc {
+    prepare_for_enterprise
+
+    if is_gomo; then
+        echo "Not ready yet"
+    else
+        sed -E -i '' '/CODE_SIGN_IDENTITY = "iPhone (Developer|Distribution)";/d' SelfService.xcodeproj/project.pbxproj
+        sed -i '' '/PROVISIONING_PROFILE_SPECIFIER.*;/d'  SelfService.xcodeproj/project.pbxproj
+    fi
+}
+
+function verify_xcode_select {
+    local xcode_path=$(xcode-select -p)
+    if [[ "$xcode_path" =~ /Xcode[\d\.]*\.app/Contents/Developer ]];
+    then
+        echo -e '\033[0;32m✓\033[0m xcode-select path is correct'
+    else
+        echo -e '\033[0;31m𐄂\033[0m xcode-select path is incorrect.'
+        echo "Use \`sudo xcode-select -s\` to switch the path to \`[Xcode Path]/Contents/Developer\`"
+    fi
+}
+
+function verify_rbenv {
+    local rbenv_command=$(command -v rbenv)
+    if [[ -n $rbenv_command ]];
+    then
+        echo -e '\033[0;32m✓\033[0m rbenv is installed.'
+    else
+        echo -e '\033[0;31m𐄂\033[0m rbenv is not installed. Install using:'
+        echo "\`brew install rbenv\`"
+    fi
+}
+
+function enable_rbenv {
+    if [[ "$SHELL" =~ "zsh" ]];
+    then
+        eval "$(rbenv init - zsh)"
+    fi
+
+    if [[ "$SHELL" =~ "bash" ]];
+    then
+        eval "$(rbenv init - bash)"
+    fi
+}
+
+function verify_rbenv_integration {
+    if [[ "$SHELL" =~ "zsh" ]];
+    then
+        local load_rbenv=$(cat ~/.zshrc 2> /dev/null | grep "rbenv init - zsh")
+        if [[ -n $load_rbenv ]]; then
+            echo -e '\033[0;32m✓\033[0m rbenv is integrated fine.'
+        else
+            echo -e '\033[0;31m𐄂\033[0m rbenv integration is not enabled, enable using:'
+            echo "\`echo \"eval \\\"\\\$(rbenv init - zsh)\\\"\" >> ~/.zshrc\`"
+            echo "Make sure you have export \`PATH=\"\$PATH:/usr/local/bin:/opt/homebrew/bin\"\` in your zshrc."
+            echo "Restart your shell session after. \`exec zsh\`"
+        fi
+    fi
+
+    if [[ "$SHELL" =~ "bash" ]];
+    then
+        local load_rbenv=$(cat ~/.bash_profile 2> /dev/null | grep "rbenv init - bash")
+        if [[ -n $load_rbenv ]]; then
+            echo -e '\033[0;32m✓\033[0m rbenv is integrated fine.'
+        else
+            echo -e '\033[0;31m𐄂\033[0m rbenv integration is not enabled, enable using:'
+            echo "\`echo \"eval \\\"\\\$(rbenv init - bash)\\\"\" >> ~/.bash_profile\`"
+            echo "Restart your shell session after. \`exec bash\`"
+        fi
+    fi
+}
+
+function verify_ruby {
+    local ruby_version=$(cat .ruby-version 2> /dev/null)
+    if [[ -z $ruby_version ]]; then
+        echo -e '\033[0;31m𐄂\033[0m Ruby version not specified. Specify using:'
+        echo "\`rbenv local <Ruby Version>\`"
+        return
+    fi
+
+    if [[ -n $(rbenv versions --bare 2> /dev/null | grep $ruby_version) ]]; then
+        echo -e "\033[0;32m✓\033[0m Required ruby version ($ruby_version) is installed."
+    else
+        echo -e '\033[0;31m𐄂\033[0m Required ruby version is not installed. Install using:'
+        echo "\`rbenv install $ruby_version\`"
+    fi
+}
+
+function verify_cocoapods {
+    local cocoapods_command=$(command -v pod)
+    local cocoapod_path=$(which pod 2> /dev/null)
+    local cocoapods_version=$(pod --version 2> /dev/null)
+    local homebrew='homebrew'
+    if [[ -z $cocoapods_command || -z $cocoapods_version ]];
+    then
+        echo -e '\033[0;31m𐄂\033[0m Cocoapods is not installed. Install using:'
+        echo "\`gem install cocoapods\`"
+    elif [[ "$cocoapod_path" =~ "$homebrew" ]];
+    then
+        echo -e '\033[0;31m𐄂\033[0m Cocoapods should not be installed using brew. Fix using:'
+        echo "\`brew uninstall cocoapods && gem install cocoapods\`"
+    elif [[ "$cocoapod_path" = "/usr/local/bin/pod" ]];
+    then
+        echo -e "\033[0;31m𐄂\033[0m Cocoapods should not be installed in system's ruby environment."
+        echo "Use a different terminal session and run"
+        echo "\`sudo gem uninstall cocoapods\`"
+    else
+        echo -e '\033[0;32m✓\033[0m Cocoapods is installed using gem in correct environment.'
+    fi
+}
+
+function doctor {
+    verify_xcode_select
+    verify_rbenv
+    verify_rbenv_integration
+    verify_ruby
+    verify_cocoapods
+}
+
+function setup {
+    rm -rf /Users/$(whoami)/Library/Developer/Xcode/DerivedData
+    
+    install_dependencies &&
+#     generate_color_assets &&
+    run_gyb &&
+    update_pods &&
+    unlock_keychain &&
+    make_dir &&
+    print_gem_env &&
+#     prepare_git_hooks
+
+    if [[ $command != "setup" ]]; then
+        update_build_phases
+        sleep 60
+    fi
+
+    if [[ "$?" -ne "0" ]]; then
+        echo "Setup Failed"
+        exit 255
+    fi
+}
+
+function upload_to_appcenter {
+    bundle exec fastlane upload_AppCenter appcenter_secret_key:$AppCenterSecret --env $Env
+}
+
+function prepare_signing {
+    local export_method=$(grep -i 'export_method\=' fastlane/.env.$Env | sed 's/export_method\=//gi' | tr '[A-Z]' '[a-z]')
+    echo "Using export method:" $export_method
+    case $export_method in
+        development)
+            prepare_for_development ;;
+        enterprise)
+            prepare_for_enterprise ;;
+        distribution)
+            prepare_for_distribution ;;
+    esac
+}
+
+function build_ipa {
+    # IMP:unlocking the login keychain is required for signing the archieve
+    security unlock-keychain -p "$Password" /Users/$(whoami)/Library/Keychains/login.keychain-db
+    echo "Listing iphone developer cert start"
+    echo "user is $(whoami)"
+    security find-certificate -a | grep -i -A 5 -B 5 "iphone developer"
+    echo "Listing iphone developer cert start end"
+
+    prepare_signing
+
+    bundle exec fastlane sign_ipa apple_id:$AppleId --env $Env
+    if [ ! -f ./releases/*.ipa ]; then
+      echo "Unable to sign and build ipa file. Failing build now."
+      exit -1
+    fi
+}
+
+function publish {
+    if [[ -z $Password || -z $AppleId || -z $Env || -z $Scheme ]]; then
+        echo "These parameters are required:"
+        echo "Password, AppleId, Env, Scheme"
+        exit 255
+    fi
+
+    check_released_branch &&
+    setup &&
+    lint &&
+    test &&
+    coverage
+
+    if [[ "$?" -ne "0" ]]; then
+        exit $?
+    fi
+
+    sonar_scan
+
+    build_ipa &&
+    upload_to_appcenter
+    copy_artifacts
+}
+
+function release_candidate {
+    if [[ -z $Password || -z $AppleId || -z $Env ]]; then
+        echo "These parameters are required:"
+        echo "Password, AppleId, Env"
+        exit 255
+    fi
+
+    setup &&
+    build_ipa &&
+    upload_to_appcenter
+}
+
+function generate_bamboo_properties {
+    make_dir
+    
+    if [[ -z $Repository || -z $Branch || -z $RepoAuth ]]; then
+        echo "These parameters are required:"
+        echo "Repository: Repository URL"
+        echo "Branch: Repository branch which will be built"
+        echo "RepoAuth: combination of user and password in the form of username:passowrd"
+        exit 255
+    fi
+    
+    # Extract the stash project key
+    projectKey="$(sed -E 's~^ssh://[^/]+/(.*)/.*~\1~g' <<< $$Repository)"
+    # Extract the stash repository slug
+    repositorySlug="$(sed -E 's~^ssh://.*/(.*)\.git~\1~g' <<< $Repository)"
+    
+    echo "projectKey: \"${projectKey}\", repositorySlug: \"${repositorySlug}\""
+    
+    # Retrieve the list of open pull requests on the server with a source of the current branch.
+    # bamboo.stash_password is username:password used to make rest calls to stash
+    pullRequestJson="$(curl -X GET -u "$RepoAuth" "https://stash.optusnet.com.au/rest/api/1.0/projects/${projectKey}/repos/${repositorySlug}/pull-requests?direction=OUTGOING&at=refs/heads/$Branch&withAttributes=false&order=NEWEST")"
+    
+    echo "pullRequestJson: \"${pullRequestJson}\""
+    # extract out the list of long-running "to" branches in the pull requests into a tab separated list.
+    unfilteredTargetNames="$(jq -r '[.values[]|.toRef.id]|@tsv' <<< $pullRequestJson)"
+    targetNames="$(jq -r '[.values[]|select(.toRef.id|test("develop/.*|develop|released/.*|develop/.*||develop_.*|rc/rc_.*|master"))|.toRef.id]|@tsv' <<< $pullRequestJson)"
+    echo "unfiltered targetNames: \"${unfilteredTargetNames}\""
+    echo "targetNames: \"${targetNames}\""
+    
+    # make sure there is a build directory to write the properties file to.
+    if [ -n "$targetNames" ]; then
+      echo "Long running branch target found."
+      echo "target.branches=${targetNames}" > build/bamboo.properties
+      echo "long.running.target=true" >> build/bamboo.properties
+    else
+      echo "Only short running branch targets found."
+      echo "target.branches=${targetNames}" > build/bamboo.properties
+      echo "long.running.target=false" >> build/bamboo.properties
+    fi
+}
+
+function print_commands {
+    echo "No command specified, specify one of these commands:"
+    echo "setup: setup"
+    echo "sonar_pull_request: build, test, and publish coverage to sonarqube"
+    echo "publish: publish to appcenter"
+    echo "generate_bamboo_properties: genererate required bamboo properties"
+}
+
+function run_command {
+
+    case $command in 
+    doctor)                         doctor ;;
+    setup)                          setup ;;
+    prepare_git_hooks)              prepare_git_hooks ;;
+    coverage_report)                coverage_report ;;
+    sonar_pull_request)             sonar_pull_request ;;
+    publish)                        publish ;;
+    release_candidate)              release_candidate ;;
+    build_ipa)                      build_ipa ;;
+    generate_bamboo_properties)     generate_bamboo_properties ;;
+    generate_color_assets)          generate_color_assets ;;
+    setup_testing)                  setup_testing ;;
+    prepare_for_development)        prepare_for_development ;;
+    prepare_for_adhoc)              prepare_for_adhoc ;;
+    prepare_for_distribution)       prepare_for_distribution ;;
+    delete_merged_branches)         delete_merged_branches ;;
+    pod_repo_update)                pod_repo_update ;;
+    pod_install)                    pod_install ;;
+    pod_update)                     pod_update ;;
+    install_or_upgrade_tooling)     install_or_upgrade_tooling ;;
+    *)                              print_commands ;;
+    esac
+}
+
+function is_gomo {
+    if [[ (-n $Env || -n $Scheme) && ( $Env =~ gomo.* || $(echo $Scheme | tr '[A-Z]' '[a-z]') =~ gomo.* ) ]]; then
+        return 0
+    fi
+    return 1
+}
+
+function cleanup {
+    disable_git_hooks
+    git checkout --force
+    # update_build_phases - Not sure why this is here, keep it commented to see if it causes any issues
+    prepare_git_hooks
+}
+
+function setup_testing {
+    if [[ -z $Env && -z $Scheme ]]; then
+        echo "Env or Scheme should be supplied"
+        return
+    fi
+
+    if is_gomo; then
+        find CommonUnitTests/* -type f \( -iname \*.swift ! -iname \*\+MyOptus.swift \) | xargs sed -i '' "s/@testable import MyOptus/@testable import GOMO/g"
+    else 
+        find CommonUnitTests/* -type f \( -iname \*.swift ! -iname \*\+GOMO.swift \) | xargs sed -i '' "s/@testable import GOMO/@testable import MyOptus/g"
+    fi
+}
+
+function prepare {
+    ignore_test_failures=false
+    rm -rf build
+    rm -rf artifacts
+    if [[ "$UseTempDirectory" == "true" ]]; then
+        working_dir=$(pwd)
+        temp_path="/Users/$(whoami)/tmp/$(pwd | rev | cut -d/ -f3 | rev)"
+        echo "Creating temp directory: $temp_path"
+        rm -rf $temp_path
+        mkdir -p $temp_path
+
+        echo "Copying sources"
+        echo "From working directory: $working_dir"
+        echo "To temp directory: $temp_path"
+        cp -r $working_dir/. $temp_path/
+        cd $temp_path
+            
+        run_command
+
+        echo "Removing any existing build data and artifacts from working directory"
+        rm -rf $working_dir/build
+        mkdir -p $working_dir/build
+
+        rm -rf $working_dir/artifacts
+        mkdir -p $working_dir/artifacts
+
+        echo "Copying build data and artifacts to working directory"
+        cp -r $temp_path/build/. $working_dir/build
+        cp -r $temp_path/artifacts/. $working_dir/artifacts
+        cd $working_dir
+
+        echo "Removing temp directory"
+        rm -rf $temp_path
+    else
+        run_command
+    fi
+}
+
+function check_released_branch() {
+    if [[ ! $(git_current_branch) =~ 'rc\/rc\_*' ]]; then
+        return 0
+    fi
+
+    local version=$(git_current_branch | sed 's/rc\/rc_//g')
+    local released_branch=$(git branch --remote | grep "released/release_$version")
+
+    echo "Checking version $version"
+
+    if [[ -n $released_branch ]]; then
+        echo "Version $version is already released, no need to provide Release Candidate builds"
+        exit 0
+    fi
+
+    return 0
+}
+
+function delete_merged_remote_branches() {
+    for branch in $(git branch --remote --merged | grep -vi 'rc\/rc\_' | grep -vi release | grep -vi develop | sed -E 's/  (remotes\/)*origin\///')
+    do
+        echo "Deleting remote branch: $branch"
+        git push --delete origin $branch 2> /dev/null
+    done
+
+    return 0
+}
+
+function fix_remote() {
+    local remote=$(git remote -vv | grep fetch)
+
+    if [[ $remote =~ .*nothing.* ]]; then
+        git remote rm origin
+        git remote add origin 'ssh://git@stash.optusnet.com.au:45222/myoptus/ios-spring.git'
+    fi
+}
+
+function delete_merged_branches() {
+    echo "Fixing remote"
+    fix_remote
+
+    echo "Fetching all remote"
+    git fetch --all --prune  &> /dev/null
+
+    echo "Checking out develop branch"
+    git checkout develop --force
+
+    delete_merged_remote_branches
+
+    for rc_branch in $(git branch --remote | grep -i 'rc\/rc\_')
+    do
+        echo "Checking out \"$rc_branch\""
+        git checkout "$rc_branch" --force
+
+        delete_merged_remote_branches
+    done
+}
+
+function pod_repo_update() {
+    # enable_rbenv
+    for repo in $(pod repo list | grep -vi '^-\s' | grep -vi repos)
+    do
+        pod repo update $repo
+
+        if [[ $? -ne 0 ]]; then
+            echo 'Updating `'$repo'` failed, trying to remove and add `'$repo'`'
+            repo_url=$(pod repo list | grep -i '\-.*url.*livepersoninc' | sed -E 's/.*\-.*URL\:\s*//g')
+            pod repo remove $repo
+            pod repo add $repo $repo_url
+        fi
+    done
+}
+
+function pod_install() {
+    # enable_rbenv
+    pod install --no-repo-update
+}
+
+function pod_update() {
+    # enable_rbenv
+    pod_repo_update
+    pod update --no-repo-update    
+}
+
+############
+### MAIN ###
+############
+
+# Explicitly setting charater encoding for this script
+export LANG=en_US.UTF-8
+export LANGUAGE=en_US.UTF-8
+export LC_ALL=en_US.UTF-8
+
+for parameter in "$@"
+do
+    key=$(echo $parameter | cut -f1 -d=)
+    value=$(echo $parameter | cut -f2 -d=)
+
+    case "$key" in
+        doctor)                         command="doctor" ;;
+        setup)                          command="setup" ;;
+        prepare_git_hooks)              command="prepare_git_hooks" ;;
+        coverage_report)                command="coverage_report" ;;
+        sonar_pull_request)             command="sonar_pull_request";;
+        publish)                        command="publish" ;;
+        release_candidate)              command="release_candidate" ;;
+        build_ipa)                      command="build_ipa" ;;
+        generate_bamboo_properties)     command="generate_bamboo_properties" ;;
+        generate_color_assets)          command="generate_color_assets" ;;
+        setup_testing)                  command="setup_testing" ;;
+        prepare_for_development)        command="prepare_for_development" ;;
+        prepare_for_adhoc)              command="prepare_for_adhoc" ;;
+        prepare_for_distribution)       command="prepare_for_distribution" ;;
+        delete_merged_branches)         command="delete_merged_branches" ;;
+        pod_repo_update)                command="pod_repo_update" ;;
+        pod_install)                    command="pod_install" ;;
+        pod_update)                     command="pod_update" ;;
+        install_or_upgrade_tooling)     command="install_or_upgrade_tooling" ;;
+        LongRun)                        LongRun=${value} ;;
+        Password)                       Password=${value} ;;
+        Scheme)                         Scheme=${value} ;;
+        Schemes)                        Schemes=${value} ;;
+        TargetBranches)                 TargetBranches=${value} ;;
+        JavaHome)                       JavaHome=${value} ;;
+        BuildMode)                      BuildMode=${value} ;;
+        AppName)                        AppName=${value} ;;
+        AppCenterSecret)                AppCenterSecret=${value} ;;
+        Repository)                     Repository=${value} ;;
+        Branch)                         Branch=${value} ;;
+        RepoAuth)                       RepoAuth=${value} ;;
+        SonarScanner)                   SonarScanner=${value} ;;
+        AppleId)                        AppleId=${value} ;;
+        Env)                            Env=$(echo $value | tr '[A-Z]' '[a-z]') ;;
+        Upgrade)                        Upgrade=${value} ;;
+        RunBundler)                     RunBundler=${value} ;;
+        UseTempDirectory)               UseTempDirectory=${value} ;;
+        *)
+    esac
+done
+
+prepare

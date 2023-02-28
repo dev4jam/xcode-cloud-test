@@ -4,4 +4,4 @@
 brew install cocoapods
 
 # Install dependencies you manage with CocoaPods.
-pod install
+./run setup
